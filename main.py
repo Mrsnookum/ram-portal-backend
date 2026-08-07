@@ -421,3 +421,58 @@ async def delete_announcement(request: DeleteAnnouncementRequest):
         return {"success": True, "message": "Announcement securely removed."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/audit-logs")
+async def get_audit_logs(requester_id: str, filter_type: str = "ALL"):
+    """Securely fetches audit logs by manually joining tables in Python to bypass strict Foreign Key requirements."""
+    try:
+        # 1. Verify access
+        req_profile = supabase.table("staff_profiles").select("role_level").eq("auth_id", requester_id).single().execute()
+        if not req_profile.data:
+            raise PermissionError("Requester profile not found.")
+            
+        req_role = req_profile.data.get("role_level")
+
+        if req_role not in ["SuperAdmin", "Principal", "Principal / Deputy"]:
+            raise PermissionError("Unauthorized access. SuperAdmin or Principal role required to view audit logs.")
+
+        # 2. Fetch the raw audit logs first (WITHOUT the relational join)
+        query = supabase.table("audit_logs").select("*").order("created_at", desc=True).limit(100)
+
+        if filter_type == "AUTH":
+            query = query.in_("action_type", ["UPDATE_STAFF", "CREATE_STAFF"])
+        elif filter_type == "GRADES":
+            query = query.in_("action_type", ["SUBMIT_GRADES", "BLOCK_APPROVE", "BLOCK_REJECT", "PUBLISH_BLOCK"])
+        elif filter_type == "ANNOUNCEMENTS":
+            query = query.in_("action_type", ["POST_ANNOUNCEMENT", "EDIT_ANNOUNCEMENT", "DELETE_ANNOUNCEMENT"])
+
+        res = query.execute()
+        logs = res.data
+        
+        if not logs:
+            return {"success": True, "logs": []}
+
+        # 3. Fetch all staff profiles and create a lookup dictionary
+        profiles_res = supabase.table("staff_profiles").select("id, auth_id, full_name, role_level").execute()
+        profiles_map = {}
+        for p in profiles_res.data:
+            # We map both 'id' and 'auth_id' to cover our bases, since different API routes might log different IDs
+            profiles_map[str(p["id"])] = {"full_name": p["full_name"], "role_level": p["role_level"]}
+            if p.get("auth_id"):
+                profiles_map[str(p["auth_id"])] = {"full_name": p["full_name"], "role_level": p["role_level"]}
+                
+        # 4. Manually stitch the profile data into the logs
+        for log in logs:
+            staff_id = str(log.get("staff_id", ""))
+            if staff_id in profiles_map:
+                log["staff_profiles"] = profiles_map[staff_id]
+            else:
+                # Fallback if the staff member was deleted from the database entirely
+                log["staff_profiles"] = {"full_name": "System / Unknown", "role_level": "Admin"}
+        
+        return {"success": True, "logs": logs}
+        
+    except Exception as e:
+        print(f"Audit Logs Fetch Error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
