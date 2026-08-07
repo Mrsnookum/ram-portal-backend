@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -61,6 +61,15 @@ class StaffRequest(BaseModel):
     department: str
     role_level: str
 
+class UpdateStaffRequest(BaseModel):
+    staff_id: str # Profile UUID
+    requester_id: str # Auth ID of the person making the change
+    full_name: str
+    email: str
+    department: str
+    role_level: str
+    is_active: bool
+
 class GradeEntry(BaseModel):
     student_name: str
     admission_number: str
@@ -79,12 +88,24 @@ class ApprovalRequest(BaseModel):
     unit_name: str
     action: str # "Approve" or "Reject"
     staff_id: str # Added to track who approved it in the Audit Logs
+    edited_grades: Optional[List[Dict[str, Any]]] = None # Captures any HOD edits made during the review process
 
 class AnnouncementRequest(BaseModel):
     title: str
     message: str
     staff_id: str
     target_audience: Optional[str] = "All Students" # Added to match your database schema securely
+
+class EditAnnouncementRequest(BaseModel):
+    announcement_id: str
+    title: str
+    message: str
+    target_audience: str
+    requester_id: str
+
+class DeleteAnnouncementRequest(BaseModel):
+    announcement_id: str
+    requester_id: str
 
 # ==========================================
 # ENDPOINTS
@@ -118,6 +139,44 @@ async def create_staff(request: StaffRequest):
 
     except Exception as e:
         print(f"Error creating staff: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/update-staff")
+async def update_staff(request: UpdateStaffRequest):
+    """Securely updates a staff member's profile and physically revokes their Auth token if disabled."""
+    try:
+        # 1. Verify the requester has authorization (SuperAdmin, Principal, or HOD managing their own dept)
+        req_profile = supabase.table("staff_profiles").select("role_level").eq("auth_id", request.requester_id).single().execute()
+        req_role = req_profile.data.get('role_level')
+        
+        if req_role not in ["SuperAdmin", "Principal", "HOD", "Deputy HOD"]:
+            raise PermissionError("You are not authorized to modify staff accounts.")
+
+        # 2. Update the public staff profile table
+        supabase.table("staff_profiles").update({
+            "full_name": request.full_name,
+            "email": request.email,
+            "department": request.department,
+            "role_level": request.role_level,
+            "is_active": request.is_active
+        }).eq("id", request.staff_id).execute()
+
+        # 3. SECURE AUTH SUSPENSION: Grab their underlying auth_id and ban them
+        staff_res = supabase.table("staff_profiles").select("auth_id").eq("id", request.staff_id).single().execute()
+        if staff_res.data and staff_res.data.get("auth_id"):
+            auth_id = staff_res.data["auth_id"]
+            # Supabase Admin trick to physically lock an account: set a ban duration
+            ban_time = "none" if request.is_active else "876000h" # 100 years suspension if deactivated
+            supabase.auth.admin.update_user_by_id(auth_id, {"ban_duration": ban_time})
+
+        # 4. Log the action
+        status_text = "Reactivated" if request.is_active else "Deactivated/Suspended"
+        log_audit(request.requester_id, "UPDATE_STAFF", f"{status_text} staff profile and updated details for {request.full_name}")
+
+        return {"success": True, "message": "Staff profile securely updated."}
+    except Exception as e:
+        print(f"Update Staff Error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -193,6 +252,33 @@ async def approve_results(request: ApprovalRequest):
     try:
         final_status = "Approved" if request.action == "Approve" else "Rejected"
         
+        # --- INCORPORATE THE HOD OVERWRITES IF ANY EXIST ---
+        if request.edited_grades and final_status == "Approved":
+            for grade_entry in request.edited_grades:
+                # Calculate new label safely on the server
+                exam_score = float(grade_entry.get('exam_score', 0))
+                is_dns = grade_entry.get('is_dns', False)
+                
+                if is_dns:
+                    total = 0.0
+                    grade_label = "DNS"
+                else:
+                    total = exam_score
+                    if total >= 80: grade_label = "Distinction"
+                    elif total >= 70: grade_label = "Credit"
+                    elif total >= 60: grade_label = "Pass"
+                    else: grade_label = "Fail"
+                    
+                # Update individually
+                supabase.table("exam_results").update({
+                    "exam_score": total,
+                    "total_score": total,
+                    "grade": grade_label
+                }).eq("block_name", request.block_name)\
+                  .eq("unit_name", request.unit_name)\
+                  .eq("admission_number", grade_entry.get('admission_number')).execute()
+        # ----------------------------------------------------
+
         # 1. Update the database securely
         supabase.table("exam_results").update({"status": final_status})\
             .eq("block_name", request.block_name)\
@@ -279,5 +365,59 @@ async def create_announcement(request: AnnouncementRequest):
         log_audit(request.staff_id, "POST_ANNOUNCEMENT", f"Posted: {request.title}")
         
         return {"success": True, "message": "Announcement broadcasted successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/edit-announcement")
+async def edit_announcement(request: EditAnnouncementRequest):
+    """Edits an announcement ONLY if the requester is the owner or an executive admin."""
+    try:
+        ann_res = supabase.table("global_announcements").select("posted_by").eq("id", request.announcement_id).single().execute()
+        if not ann_res.data:
+            raise ValueError("Announcement not found.")
+        
+        posted_by = ann_res.data.get("posted_by")
+        
+        req_profile = supabase.table("staff_profiles").select("role_level").eq("auth_id", request.requester_id).single().execute()
+        req_role = req_profile.data.get("role_level")
+
+        if posted_by != request.requester_id and req_role not in ["SuperAdmin", "Principal", "Principal / Deputy"]:
+            raise PermissionError("Unauthorized to edit this announcement. You are not the owner.")
+
+        supabase.table("global_announcements").update({
+            "title": request.title,
+            "message": request.message,
+            "target_audience": request.target_audience
+        }).eq("id", request.announcement_id).execute()
+
+        log_audit(request.requester_id, "EDIT_ANNOUNCEMENT", f"Edited announcement ID: {request.announcement_id}")
+        return {"success": True, "message": "Announcement securely updated."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/delete-announcement")
+async def delete_announcement(request: DeleteAnnouncementRequest):
+    """Soft deletes an announcement ONLY if the requester is the owner or an executive admin."""
+    try:
+        ann_res = supabase.table("global_announcements").select("posted_by").eq("id", request.announcement_id).single().execute()
+        if not ann_res.data:
+            raise ValueError("Announcement not found.")
+        
+        posted_by = ann_res.data.get("posted_by")
+
+        req_profile = supabase.table("staff_profiles").select("role_level").eq("auth_id", request.requester_id).single().execute()
+        req_role = req_profile.data.get("role_level")
+
+        if posted_by != request.requester_id and req_role not in ["SuperAdmin", "Principal", "Principal / Deputy"]:
+            raise PermissionError("Unauthorized to delete this announcement. You are not the owner.")
+
+        supabase.table("global_announcements").update({
+            "is_active": False
+        }).eq("id", request.announcement_id).execute()
+
+        log_audit(request.requester_id, "DELETE_ANNOUNCEMENT", f"Soft-deleted announcement ID: {request.announcement_id}")
+        return {"success": True, "message": "Announcement securely removed."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
