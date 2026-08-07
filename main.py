@@ -66,6 +66,7 @@ class GradeEntry(BaseModel):
     admission_number: str
     cat_score: float
     exam_score: float
+    is_dns: Optional[bool] = False # Added DNS flag
 
 class GradeSubmission(BaseModel):
     block_name: str
@@ -123,20 +124,42 @@ async def create_staff(request: StaffRequest):
 @app.post("/api/submit-grades")
 async def submit_grades(request: GradeSubmission):
     try:
+        # --- SERVER-SIDE 100% MATH GATEWAY VALIDATION ---
+        # 1. Fetch expected ungraded students for this block and unit
+        students_res = supabase.table("students").select("admission_number").eq("block", request.block_name).eq("is_approved", True).execute()
+        all_students_in_block = [row['admission_number'] for row in students_res.data]
+        
+        grades_res = supabase.table("exam_results").select("admission_number").eq("block_name", request.block_name).eq("unit_name", request.unit_name).execute()
+        already_graded = [row['admission_number'] for row in grades_res.data]
+        
+        expected_ungraded = [adm for adm in all_students_in_block if adm not in already_graded]
+        submitted_admissions = [entry.admission_number for entry in request.grades]
+        
+        # Verify every expected student is in the submission
+        missing = [adm for adm in expected_ungraded if adm not in submitted_admissions]
+        if missing:
+            raise ValueError(f"100% Math Gateway Failed: Missing results for {len(missing)} expected student(s). All students must be accounted for or marked as DNS.")
+        # -------------------------------------------------
+
         payload = []
         for entry in request.grades:
-            # 1. Python calculates the total securely on the server
-            total = entry.cat_score + entry.exam_score
-            
-            # 2. Python determines the grade securely
-            if total >= 80:
-                grade_label = "Distinction"
-            elif total >= 70:
-                grade_label = "Credit"
-            elif total >= 60:
-                grade_label = "Pass"
+            # Check for DNS
+            if entry.is_dns:
+                total = 0.0
+                grade_label = "DNS"
             else:
-                grade_label = "Fail"
+                # 1. Python calculates the total securely on the server
+                total = entry.cat_score + entry.exam_score
+                
+                # 2. Python determines the grade securely
+                if total >= 80:
+                    grade_label = "Distinction"
+                elif total >= 70:
+                    grade_label = "Credit"
+                elif total >= 60:
+                    grade_label = "Pass"
+                else:
+                    grade_label = "Fail"
 
             payload.append({
                 "student_name": entry.student_name,
@@ -161,7 +184,8 @@ async def submit_grades(request: GradeSubmission):
 
     except Exception as e:
         print(f"Server Error: {str(e)}")
-        raise HTTPException(status_code=400, detail="Failed to process grades securely on the server.")
+        # Send the exact error message back to the frontend toast notification
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/api/approve-results")
@@ -208,10 +232,16 @@ async def approve_results(request: ApprovalRequest):
 
 @app.get("/api/ungraded-students/{block_name}/{unit_name}")
 async def get_ungraded_students(block_name: str, unit_name: str):
-    """Fetches students in a block who have NOT yet received a grade for a specific unit."""
+    """Fetches ONLY approved students in a block who have NOT yet received a grade for a specific unit."""
     try:
-        # 1. Fetch all students in this block (FIXED: using 'first_name, last_name' and 'block')
-        students_res = supabase.table("students").select("first_name, last_name, admission_number").eq("block", block_name).execute()
+        # 1. Fetch all APPROVED students in this block
+        students_res = (
+            supabase.table("students")
+            .select("first_name, last_name, admission_number")
+            .eq("block", block_name)
+            .eq("is_approved", True)
+            .execute()
+        )
         all_students = students_res.data
         
         # 2. Fetch all students who already have a grade entry for this unit
