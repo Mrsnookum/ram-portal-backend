@@ -16,6 +16,9 @@ load_dotenv()
 # Initialize FastAPI
 app = FastAPI()
 
+@app.get("/")
+async def root():
+    return {"status": "Python Backend is Awake"}
 # Enable CORS so your frontend dashboard can talk to this API without browser errors
 app.add_middleware(
     CORSMiddleware,
