@@ -22,6 +22,11 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Keep-Alive Endpoint for UptimeRobot
+app.get('/', (req, res) => {
+    res.status(200).send('WhatsApp Engine is Awake!');
+});
+
 let sock = null;
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
