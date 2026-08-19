@@ -31,7 +31,6 @@ const delay = ms => new Promise(res => setTimeout(res, ms));
 // ADMIN ALERT SYSTEM (TELEGRAM)
 // ==========================================
 async function notifyAdmin(message) {
-    // These will be pulled from your Render Environment Variables
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     
@@ -50,8 +49,6 @@ async function notifyAdmin(message) {
         } catch (error) {
             console.error("❌ Failed to send Telegram alert:", error);
         }
-    } else {
-        console.log("⚠️ Telegram credentials not set. Skipping alert.");
     }
 }
 
@@ -64,7 +61,7 @@ async function useSupabaseAuthState() {
             const serialized = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
             await supabase.from('whatsapp_session').upsert({ id: id, data: serialized });
         } catch (error) {
-            console.error("Error writing to Supabase:", error);
+            console.error("Error writing single key to Supabase:", error);
         }
     };
 
@@ -75,14 +72,6 @@ async function useSupabaseAuthState() {
             return JSON.parse(JSON.stringify(data.data), BufferJSON.reviver);
         } catch (error) {
             return null;
-        }
-    };
-
-    const removeData = async (id) => {
-        try {
-            await supabase.from('whatsapp_session').delete().eq('id', id);
-        } catch (error) {
-            console.error("Error removing from Supabase:", error);
         }
     };
 
@@ -106,17 +95,33 @@ async function useSupabaseAuthState() {
                     return data;
                 },
                 set: async (data) => {
-                    // FIX: Save keys sequentially to avoid overloading the Supabase connection pool
+                    // FIX: BATCH writes. Sends all keys in ONE single lightning-fast request!
+                    const upserts = [];
+                    const deletes = [];
+                    
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
                             const key = `${category}-${id}`;
+                            
                             if (value) {
-                                await writeData(value, key);
+                                const serialized = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
+                                upserts.push({ id: key, data: serialized });
                             } else {
-                                await removeData(key);
+                                deletes.push(key);
                             }
                         }
+                    }
+                    
+                    try {
+                        if (upserts.length > 0) {
+                            await supabase.from('whatsapp_session').upsert(upserts);
+                        }
+                        if (deletes.length > 0) {
+                            await supabase.from('whatsapp_session').delete().in('id', deletes);
+                        }
+                    } catch (error) {
+                        console.error("❌ Batch DB write failed:", error);
                     }
                 }
             }
@@ -131,7 +136,9 @@ async function connectToWhatsApp() {
     const { state, saveCreds } = await useSupabaseAuthState();
     
     sock = makeWASocket({
-        auth: state
+        auth: state,
+        printQRInTerminal: false,
+        browser: ['RAM Portal Engine', 'Chrome', '1.0.0'], // Adds stability to connection
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -139,13 +146,12 @@ async function connectToWhatsApp() {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // --- CLOUD-FRIENDLY PAIRING CODE GENERATOR ---
         if (qr && !sock.authState.creds.registered) {
-            // Pull the number from Render environment variables, or fallback to a hardcoded string
-            const number = process.env.BOT_PHONE_NUMBER || "254743611394"; // <-- UPDATE THIS FALLBACK NUMBER
+            let rawNumber = process.env.BOT_PHONE_NUMBER || "254743611394";
+            let cleanNumber = rawNumber.replace(/[^0-9]/g, ''); 
             
             try {
-                let code = await sock.requestPairingCode(number.trim());
+                let code = await sock.requestPairingCode(cleanNumber);
                 code = code?.match(/.{1,4}/g)?.join('-') || code; 
                 
                 console.log(`\n=================================================`);
@@ -161,17 +167,13 @@ async function connectToWhatsApp() {
             console.log('Connection closed. Reconnecting:', shouldReconnect);
             
             if (shouldReconnect) {
-                setTimeout(() => connectToWhatsApp(), 2000); 
+                setTimeout(() => connectToWhatsApp(), 3000); 
             } else {
-                // --- THE SEMI-AUTO-FIX LOGIC ---
                 console.log("Logged out permanently. Initiating auto-cleanup...");
-                
-                // 1. Alert the Admin
                 await notifyAdmin("WhatsApp Engine Disconnected! ⚠️\n\nThe device was logged out. The database is being auto-cleared. Please restart the Render server to generate a new pairing code.");
                 
-                // 2. Auto-clear the Supabase database
                 try {
-                    await supabase.from('whatsapp_session').delete().neq('id', '0'); // Deletes all records
+                    await supabase.from('whatsapp_session').delete().neq('id', '0'); 
                     console.log("✅ Database auto-cleared successfully.");
                 } catch (e) {
                     console.error("❌ Failed to auto-clear database:", e);
