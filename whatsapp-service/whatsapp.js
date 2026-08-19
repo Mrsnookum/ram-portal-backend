@@ -137,8 +137,7 @@ async function connectToWhatsApp() {
     
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false,
-        browser: ['RAM Portal Engine', 'Chrome', '1.0.0'], // Adds stability to connection
+        printQRInTerminal: false
     });
 
     sock.ev.on('creds.update', saveCreds);
