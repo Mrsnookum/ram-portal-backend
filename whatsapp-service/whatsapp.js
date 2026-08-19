@@ -106,15 +106,18 @@ async function useSupabaseAuthState() {
                     return data;
                 },
                 set: async (data) => {
-                    const tasks = [];
+                    // FIX: Save keys sequentially to avoid overloading the Supabase connection pool
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
                             const key = `${category}-${id}`;
-                            tasks.push(value ? writeData(value, key) : removeData(key));
+                            if (value) {
+                                await writeData(value, key);
+                            } else {
+                                await removeData(key);
+                            }
                         }
                     }
-                    await Promise.all(tasks);
                 }
             }
         },
